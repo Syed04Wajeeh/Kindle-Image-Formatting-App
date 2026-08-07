@@ -21,6 +21,7 @@ import hashlib
 import json
 import socket
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -65,16 +66,68 @@ def _recv(sock: socket.socket) -> tuple[int, dict]:
 
 # ── Protocol handler (runs after KOReader connects) ───────────────────────────
 
+def _drain(conn: socket.socket, timeout: float = 0.4) -> None:
+    """Read and discard any extra messages KOReader volunteers after a book.
+    Best-effort: swallows every error, because anything left unread here would
+    desync the next book's handshake. A genuinely dead connection will surface
+    on the next _send."""
+    old = conn.gettimeout()
+    conn.settimeout(timeout)
+    try:
+        while True:
+            _recv(conn)
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.settimeout(old)
+        except Exception:
+            pass
+
+
+def _wait_for_ok(conn: socket.socket, timeout: float = 20.0) -> bool:
+    """Wait for KOReader's OK-to-send, skipping over any stray messages.
+
+    Tolerating strays matters: a late receipt or an lpath-change notification
+    arriving here used to be mistaken for the OK, desyncing every later book.
+    Returns True if the OK arrived, False on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    old = conn.gettimeout()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            conn.settimeout(remaining)
+            try:
+                opcode, _ = _recv(conn)
+            except socket.timeout:
+                return False
+            if opcode == _OK:
+                return True
+            # Anything else is a stray — ignore it and keep waiting for the OK.
+    finally:
+        try:
+            conn.settimeout(old)
+        except Exception:
+            pass
+
+
 def _handle_connection(
     conn: socket.socket,
     file_paths: list[Path],
     password: str,
-) -> None:
+    on_progress=None,
+) -> tuple[int, list[str]]:
+    """Push every file. Returns (sent_count, failure_descriptions)."""
     conn.settimeout(30)
 
     challenge = str(uuid.uuid4())
 
-    # 1. Send INIT — server always goes first
+    # 1. Send INIT — server always goes first.
+    # canSupportLpathChanges=False: avoids an extra per-book lpath-change message
+    # from KOReader that would desync the protocol for book 2+.
     _send(conn, _INIT, {
         "serverProtocolVersion": 1,
         "validExtensions": ["png", "jpg", "jpeg", "epub", "pdf", "mobi", "cbz"],
@@ -83,7 +136,7 @@ def _handle_connection(
         "currentLibraryUUID": str(uuid.uuid4()),
         "calibre_version": [6, 0, 0],
         "canSupportUpdateBooks": True,
-        "canSupportLpathChanges": True,
+        "canSupportLpathChanges": False,
     })
     _, init_resp = _recv(conn)
 
@@ -115,7 +168,7 @@ def _handle_connection(
     })
     _recv(conn)
 
-    # 5. Get book count — must drain all metadata responses before sending books
+    # 5. Get book count — drain all metadata responses before sending books
     _send(conn, _GET_BOOK_COUNT, {
         "canStream": True,
         "canScan": True,
@@ -129,34 +182,66 @@ def _handle_connection(
 
     # 6. Push each file
     total = len(file_paths)
+    sent = 0
+    failed: list[str] = []
+
     for i, path in enumerate(file_paths):
         raw = path.read_bytes()
         lpath = path.name
 
-        _send(conn, _SEND_BOOK, {
-            "lpath": lpath,
-            "length": len(raw),
-            "metadata": {
-                "title": path.stem,
-                "authors": ["Unknown"],
-                "uuid": str(uuid.uuid4()),
+        try:
+            _send(conn, _SEND_BOOK, {
                 "lpath": lpath,
-            },
-            "thisBook": i,
-            "totalBooks": total,
-            "willStreamBinary": True,
-            "wantsSendOkToSendbook": True,
-            "canSupportLpathChanges": True,
-        })
-        _recv(conn)  # KOReader ready
+                "length": len(raw),
+                "metadata": {
+                    "title": path.stem,
+                    "authors": ["Unknown"],
+                    "uuid": str(uuid.uuid4()),
+                    "lpath": lpath,
+                },
+                "thisBook": i,
+                "totalBooks": total,
+                "willStreamBinary": True,
+                "wantsSendOkToSendbook": True,
+                "canSupportLpathChanges": False,
+            })
 
-        for offset in range(0, len(raw), chunk_size):
-            conn.sendall(raw[offset : offset + chunk_size])
-        _recv(conn)  # KOReader confirmed receipt
+            if not _wait_for_ok(conn):
+                failed.append(f"{lpath} (no OK-to-send)")
+                print(f"[koreader] {i+1}/{total} {lpath}: no OK-to-send, skipped", flush=True)
+                continue
+
+            for offset in range(0, len(raw), chunk_size):
+                conn.sendall(raw[offset : offset + chunk_size])
+
+            # Calibre does NOT block on a receipt here — it moves to the next
+            # book immediately. Blocking on _recv() was what stalled the loop
+            # after book 1. Drain instead: harmless if KOReader says nothing,
+            # and it clears anything it does volunteer so the next book's
+            # handshake stays in sync.
+            _drain(conn)
+
+            sent += 1
+            print(f"[koreader] {i+1}/{total} {lpath}: sent ({len(raw)} bytes)", flush=True)
+            if on_progress:
+                on_progress(sent, total, lpath)
+
+        except (socket.timeout, OSError, ConnectionError) as exc:
+            # One bad book shouldn't abort the whole batch, but a dead socket
+            # means nothing more can go out.
+            failed.append(f"{lpath} ({exc})")
+            print(f"[koreader] {i+1}/{total} {lpath}: FAILED {exc}", flush=True)
+            break
 
     # 7. Disconnect
-    _send(conn, _NOOP, {"ejecting": True})
-    _recv(conn)
+    try:
+        _send(conn, _NOOP, {"ejecting": True})
+        _drain(conn)
+    except Exception:
+        pass
+
+    print(f"[koreader] done: {sent}/{total} sent", flush=True)
+    return sent, failed
 
 
 # ── Discovery broadcaster (UDP) ────────────────────────────────────────────────
@@ -281,9 +366,11 @@ class KOReaderServer:
         self,
         file_paths: list[Path],
         timeout: int = 120,
-    ) -> None:
+        on_progress=None,
+    ) -> tuple[int, list[str]]:
         """
         Block until KOReader connects, then push files.
+        Returns (sent_count, failures).
         Raises TimeoutError if no connection within `timeout` seconds.
         """
         if self._tcp_sock is None:
@@ -306,7 +393,7 @@ class KOReaderServer:
             )
 
         try:
-            _handle_connection(conn, file_paths, self._password)
+            return _handle_connection(conn, file_paths, self._password, on_progress)
         finally:
             conn.close()
 
@@ -324,15 +411,16 @@ def send_files(
     tcp_port: int = DEFAULT_TCP_PORT,
     password: str = "",
     timeout: int = 120,
-) -> None:
+    on_progress=None,
+) -> tuple[int, list[str]]:
     """
     Convenience wrapper: start server, wait for KOReader, push files, stop.
-    Blocks until done or timeout.
+    Blocks until done or timeout. Returns (sent_count, failures).
     """
     server = KOReaderServer(tcp_port=tcp_port, password=password)
     server.start()
     try:
-        server.wait_and_send(file_paths, timeout=timeout)
+        return server.wait_and_send(file_paths, timeout=timeout, on_progress=on_progress)
     finally:
         server.stop()
 
